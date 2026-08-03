@@ -86,7 +86,7 @@ class ReportePDF(FPDF):
         self.set_fill_color(*bg); self.rounded_rect(x, y, w, h, r, style='F')
 
 def clean_text(text):
-    if pd.isna(text): return "-"
+    if pd.isna(text) or str(text).lower() in ['nan', 'none', '']: return "-"
     return str(text).replace('•', '-').replace('➤', '>').encode('latin-1', 'replace').decode('latin-1')
 
 def render_and_insert_chart(fig, pdf, x, y, w, h_fig=300):
@@ -119,6 +119,7 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             q_piezas = f"SELECT c.Name as Máquina, COALESCE(pr.Code, 'S/C') as Pieza, SUM(COALESCE(p.Scrap, 0)) as Scrap, SUM(COALESCE(p.Rework, 0)) as RT FROM PROD_M_01 p JOIN CELL c ON p.CellId = c.CellId LEFT JOIN PRODUCT pr ON p.ProductId = pr.ProductId WHERE p.Year = {anio} AND p.Month = {mes} GROUP BY c.Name, pr.Code"
             q_trend_oee = f"SELECT p.Month, c.Name as Máquina, SUM(COALESCE(p.ProductiveTime, 0)) as T_Operativo, SUM(COALESCE(p.DownTime, 0)) as T_Parada, SUM(COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0)) as T_Planificado, SUM(COALESCE(p.Performance, 0) * COALESCE(p.ProductiveTime, 0)) as Perf_Num, SUM(COALESCE(p.Availability, 0) * (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0))) as Disp_Num, SUM(COALESCE(p.Quality, 0) * (COALESCE(p.Good, 0) + COALESCE(p.Rework, 0) + COALESCE(p.Scrap, 0))) as Cal_Num, SUM(COALESCE(p.Oee, 0) * (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0))) as OEE_Num FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month <= {mes} GROUP BY p.Month, c.Name"
             q_trend_pcs = f"SELECT p.Month, c.Name as Máquina, SUM(COALESCE(p.Good, 0)) as Buenas, SUM(COALESCE(p.Rework, 0)) as Retrabajo, SUM(COALESCE(p.Scrap, 0)) as Observadas, SUM(COALESCE(p.Good, 0) + COALESCE(p.Rework, 0) + COALESCE(p.Scrap, 0)) as Totales FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month <= {mes} GROUP BY p.Month, c.Name"
+            
             q_m06 = f"SELECT 'GLOBAL' as Nivel, 'GLOBAL' as Grupo, Performance, Availability as Disp, Quality as Cal, Oee FROM PROD_M_06 WHERE Year = {anio} AND Month = {mes}"
             q_m05 = f"SELECT 'FABRICA' as Nivel, UPPER(f.Name) as Grupo, p.Performance, p.Availability as Disp, p.Quality as Cal, p.Oee FROM PROD_M_05 p JOIN FACTORY f ON p.FactoryId = f.FactoryId WHERE p.Year = {anio} AND p.Month = {mes}"
             q_m04 = f"SELECT 'LINEA' as Nivel, UPPER(l.Name) as Grupo, p.Performance, p.Availability as Disp, p.Quality as Cal, p.Oee FROM PROD_M_04 p JOIN LINE l ON p.LineId = l.LineId WHERE p.Year = {anio} AND p.Month = {mes}"
@@ -136,7 +137,7 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
                 
                 # LIMPIEZA AGRESIVA DE NANs
                 for c in ['Nivel Evento 1', 'Nivel Evento 2', 'Nivel Evento 3', 'Nivel Evento 4']:
-                    df_r[c] = df_r[c].astype(str).replace(['nan', 'None', 'NaN'], '').str.strip()
+                    if c in df_r.columns: df_r[c] = df_r[c].astype(str).replace(['nan', 'None', 'NaN'], '').str.strip()
 
                 mask = (df_r['Nivel Evento 1'].str.upper().str.contains('PROYECTO') | df_r['Nivel Evento 2'].str.upper().str.contains('PROYECTO'))
                 df_r = df_r[~mask].copy()
@@ -152,7 +153,8 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
                 
                 def get_det(r):
                     for lvl in ['Nivel Evento 4', 'Nivel Evento 3', 'Nivel Evento 2', 'Nivel Evento 1']:
-                        if r.get(lvl): return r[lvl]
+                        val = str(r.get(lvl, ''))
+                        if val and val.lower() not in ['nan', 'none', '']: return val
                     return 'Sin Detalle'
                 df_r['Detalle_Final'] = df_r.apply(get_det, axis=1)
 
@@ -179,7 +181,7 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
 
                 def parse_ev(row):
                     n = [str(row.get(f'Nivel Evento {i}', '')).strip().upper() for i in range(1, 7)]
-                    v = [x for x in n if x and x not in ['NONE', 'NAN', 'NULL']]
+                    v = [x for x in n if x and x not in ['NONE', 'NAN', 'NULL', '']]
                     if not v: return 'Falla/Gestión', 'Otra', 'Sin detalle'
                     txt = " > ".join(v)
                     est = 'Falla/Gestión'
@@ -187,12 +189,14 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
                     elif any(x in txt for x in ['PARADA PROGRAMADA', 'SMED']): est = 'Parada Programada'
                     elif 'PRODUCCION' in v[0]: est = 'Producción'
                     mac = 'Otra Falla/Gestión'
-                    areas = {'MANTENIMIENTO': 'Mantenimiento', 'MATRICERIA': 'Matricería', 'GESTION': 'Gestión', 'CALIDAD': 'Calidad'}
+                    areas = {'MANTENIMIENTO': 'Mantenimiento', 'MATRICERIA': 'Matricería', 'GESTION': 'Gestión', 'CALIDAD': 'Calidad', 'LOGISTICA': 'Logística'}
                     for ev in reversed(v):
                         for k, a in areas.items():
                             if k in ev: mac = a; break
                         if mac != 'Otra Falla/Gestión': break
-                    return est, mac, f"[{mac.upper()}] {v[-1]}" if mac != 'Otra Falla/Gestión' else v[-1]
+                    
+                    fallo = v[-1] if v else 'Sin detalle'
+                    return est, mac, fallo
                 df_r[['Estado_Global', 'Categoria_Macro', 'Detalle_Final']] = df_r.apply(lambda r: pd.Series(parse_ev(r)), axis=1)
 
             q_m06 = f"SELECT 'GLOBAL' as Nivel, 'GLOBAL' as Grupo, Performance, Availability as Disp, Quality as Cal, Oee FROM PROD_M_06 WHERE Year = {anio} AND Month = {mes}"
@@ -277,7 +281,7 @@ def run_pdf_oee(planta, area, label_rep, df_kpi, df_trend, df_fallos, conf):
             if not df_g_fal.empty and df_g_fal['Minutos'].sum() > 0:
                 tt = df_g_fal['Minutos'].sum()
                 pdf.set_xy(10, 158); pdf.set_font("Arial", 'B', 8); pdf.set_fill_color(*theme_color); pdf.set_text_color(255)
-                pdf.cell(100, 5, "FALLO", 1, 0, 'L', True); pdf.cell(18, 5, "MIN", 1, 0, 'C', True); pdf.cell(18, 5, "%", 1, 1, 'C', True)
+                pdf.cell(100, 5, "FALLO / DEFECTO", 1, 0, 'L', True); pdf.cell(18, 5, "MIN", 1, 0, 'C', True); pdf.cell(18, 5, "%", 1, 1, 'C', True)
                 pdf.set_font("Arial", '', 7.5); pdf.set_text_color(0)
                 
                 for _, r in df_g_fal.head(5).iterrows():
@@ -311,8 +315,8 @@ def run_pdf_prod(planta, area, label_rep, df_prod, df_tprod, df_pza, hs_rt, conf
         pdf.cell(197, 6, f"PLANTA {area.upper()} - {target if target != area.upper() else 'GENERAL'}", 1, 0, 'C', True)
         pdf.cell(40, 6, "PRODUCTIVO", 1, 1, 'C', True)
 
+        # Cálculo dinámico basado en las ediciones
         df_g_tprod = df_tprod[df_tprod['Grupo'] == target].sort_values('Mes').copy()
-        # Recalcular porcentajes dinámicamente si el usuario editó las cantidades
         df_g_tprod['Scrap_pct'] = (df_g_tprod['Scrap'] / df_g_tprod['Totales'].replace(0,1)) * 100
         df_g_tprod['RT_pct'] = (df_g_tprod['RT'] / df_g_tprod['Totales'].replace(0,1)) * 100
         
@@ -352,7 +356,7 @@ def run_pdf_prod(planta, area, label_rep, df_prod, df_tprod, df_pza, hs_rt, conf
     return pdf.output(dest='S').encode('latin-1')
 
 # ==========================================
-# 4. APP STREAMLIT (UI OPTIMIZADA CON LAYOUT)
+# 4. APP STREAMLIT (UI OPTIMIZADA CON 5 PESTAÑAS)
 # ==========================================
 st.title("🖨️ Generador de Reportes (Data & Layout Editor)")
 st.markdown("Los datos vienen directamente de **SQL**. Revisa y edita las tablas por área antes de generar los PDFs.")
@@ -485,23 +489,29 @@ if not df_p.empty:
 def edit_kpi(df, key):
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"kpi_{key}", column_config={
         "Nivel": st.column_config.TextColumn(disabled=True), "Grupo": st.column_config.TextColumn("Línea/Grupo", disabled=True),
-        "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01), "Disp": st.column_config.NumberColumn("Disponibilidad (%)", format="%.2f%%", step=0.01),
-        "Cal": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01), "Oee": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01)
+        "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01), 
+        "Disp": st.column_config.NumberColumn("Disponibilidad (%)", format="%.2f%%", step=0.01),
+        "Cal": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01), 
+        "Oee": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01)
     })
 
 def edit_toee(df, key):
     if df.empty: return pd.DataFrame(columns=['Grupo', 'Mes', 'Mes_Str', 'OEE', 'Performance', 'Disponibilidad', 'Calidad'])
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"toee_{key}", column_config={
         "Grupo": st.column_config.TextColumn(disabled=True), "Mes": st.column_config.NumberColumn(disabled=True), "Mes_Str": st.column_config.TextColumn("Mes", disabled=True),
-        "OEE": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01), "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01),
-        "Disponibilidad": st.column_config.NumberColumn("Disp. (%)", format="%.2f%%", step=0.01), "Calidad": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01)
+        "OEE": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01), 
+        "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01),
+        "Disponibilidad": st.column_config.NumberColumn("Disp. (%)", format="%.2f%%", step=0.01), 
+        "Calidad": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01)
     })
 
 def edit_fallos(df, key):
     if df.empty: return pd.DataFrame(columns=['Grupo', 'Fallo', 'Minutos', 'Categoria'])
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"fallos_{key}", num_rows="dynamic", column_config={
-        "Grupo": st.column_config.TextColumn(disabled=True), "Fallo": st.column_config.TextColumn("Defecto / Parada"),
-        "Categoria": st.column_config.TextColumn("Categoría Macro"), "Minutos": st.column_config.NumberColumn("Minutos", step=1)
+        "Grupo": st.column_config.TextColumn(disabled=True), 
+        "Fallo": st.column_config.TextColumn("Defecto / Parada"),
+        "Categoria": st.column_config.TextColumn("Categoría Macro"), 
+        "Minutos": st.column_config.NumberColumn("Minutos", step=1)
     })
 
 def edit_prod(df, key):
@@ -524,47 +534,73 @@ def edit_pza(df, grps, key):
         "Scrap": st.column_config.NumberColumn("Scrap (Cant)", step=1), "RT": st.column_config.NumberColumn("Re-Trabajo (Cant)", step=1)
     })
 
-# --- INTERFAZ TABS 6 ---
-t_oe, t_os, t_pe, t_ps, t_g, t_d = st.tabs(["⚙️ OEE Estamp.", "🔥 OEE Sold.", "🏭 Prod. Estamp.", "🏭 Prod. Sold.", "🌍 Global", "🖨️ Exportar PDFs"])
+# --- INTERFAZ 5 PESTAÑAS ---
+t_oe, t_os, t_pe, t_ps, t_g = st.tabs(["⚙️ OEE Estampado", "🔥 OEE Soldadura", "🏭 Prod. Estampado", "🏭 Prod. Soldadura", "🌍 Global"])
+l_rep = f"{m_sel}/{a_sel}"
 
 with t_oe:
-    st.markdown("### Área: ESTAMPADO - GESTIÓN A LA VISTA (OEE)")
+    st.markdown("### GESTIÓN A LA VISTA (OEE) - ESTAMPADO")
     st.write("1. **KPIs del Mes**")
     ek_e = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='ESTAMPADO') | df_b_oee['Grupo'].isin(conf['grupos_estampado'])], "e")
     st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
     eto_e = edit_toee(df_b_toee[(df_b_toee['Grupo']=='ESTAMPADO') | df_b_toee['Grupo'].isin(conf['grupos_estampado'])], "e")
     st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
     ef_e = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='ESTAMPADO') | df_b_fallos['Grupo'].isin(conf['grupos_estampado'])], "e")
+    st.divider()
+    if st.button("🖨️ Generar PDF OEE Estampado", use_container_width=True, type="primary"):
+        with st.spinner("Procesando PDF..."): st.session_state['pe1'] = run_pdf_oee(planta_sel, "Estampado", l_rep, pd.concat([ek_e]), pd.concat([eto_e]), pd.concat([ef_e]), conf)
+    if 'pe1' in st.session_state: st.download_button("📥 Descargar OEE Estampado", st.session_state['pe1'], f"{planta_sel}_OEE_ESTAMPADO.pdf", use_container_width=True)
 
 with t_os:
-    st.markdown("### Área: SOLDADURA - GESTIÓN A LA VISTA (OEE)")
+    st.markdown("### GESTIÓN A LA VISTA (OEE) - SOLDADURA")
     st.write("1. **KPIs del Mes**")
     ek_s = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='SOLDADURA') | df_b_oee['Grupo'].isin(conf['grupos_soldadura'])], "s")
     st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
     eto_s = edit_toee(df_b_toee[(df_b_toee['Grupo']=='SOLDADURA') | df_b_toee['Grupo'].isin(conf['grupos_soldadura'])], "s")
     st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
     ef_s = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='SOLDADURA') | df_b_fallos['Grupo'].isin(conf['grupos_soldadura'])], "s")
+    st.divider()
+    if st.button("🖨️ Generar PDF OEE Soldadura", use_container_width=True, type="primary"):
+        with st.spinner("Procesando PDF..."): st.session_state['ps1'] = run_pdf_oee(planta_sel, "Soldadura", l_rep, pd.concat([ek_s]), pd.concat([eto_s]), pd.concat([ef_s]), conf)
+    if 'ps1' in st.session_state: st.download_button("📥 Descargar OEE Soldadura", st.session_state['ps1'], f"{planta_sel}_OEE_SOLDADURA.pdf", use_container_width=True)
 
 with t_pe:
-    st.markdown("### Área: ESTAMPADO - INFORME PRODUCTIVO")
+    st.markdown("### INFORME PRODUCTIVO - ESTAMPADO")
     st.write("1. **Cantidades del Mes**")
     ep_e = edit_prod(df_b_prod[(df_b_prod['Grupo']=='ESTAMPADO') | df_b_prod['Grupo'].isin(conf['grupos_estampado'])], "e")
     st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
     etp_e = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='ESTAMPADO') | df_b_tprod['Grupo'].isin(conf['grupos_estampado'])], "e")
     st.write("3. **Top 5 Piezas Defectuosas**")
     epz_e = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_estampado'])], conf['grupos_estampado'], "e")
+    st.divider()
+    if st.button("🖨️ Generar PDF Prod. Estampado", use_container_width=True, type="primary"):
+        # Autocalcular mes actual en la tendencia productiva antes de pasar al PDF
+        for _, r in ep_e.iterrows():
+            idx = (etp_e['Grupo'] == r['Grupo']) & (etp_e['Mes'] == m_sel)
+            if any(idx): etp_e.loc[idx, ['Totales', 'Scrap', 'RT']] = [r['Totales'], r['Scrap'], r['Retrabajo']]
+            else: etp_e = pd.concat([etp_e, pd.DataFrame([{'Grupo':r['Grupo'], 'Mes':m_sel, 'Mes_Str':MESES_MAP[m_sel], 'Totales':r['Totales'], 'Scrap':r['Scrap'], 'RT':r['Retrabajo']}])], ignore_index=True)
+        with st.spinner("Procesando PDF..."): st.session_state['pe2'] = run_pdf_prod(planta_sel, "Estampado", l_rep, pd.concat([ep_e]), pd.concat([etp_e]), pd.concat([epz_e]), hs_rt, conf)
+    if 'pe2' in st.session_state: st.download_button("📥 Descargar Prod. Estampado", st.session_state['pe2'], f"{planta_sel}_PROD_ESTAMPADO.pdf", use_container_width=True)
 
 with t_ps:
-    st.markdown("### Área: SOLDADURA - INFORME PRODUCTIVO")
+    st.markdown("### INFORME PRODUCTIVO - SOLDADURA")
     st.write("1. **Cantidades del Mes**")
     ep_s = edit_prod(df_b_prod[(df_b_prod['Grupo']=='SOLDADURA') | df_b_prod['Grupo'].isin(conf['grupos_soldadura'])], "s")
     st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
     etp_s = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='SOLDADURA') | df_b_tprod['Grupo'].isin(conf['grupos_soldadura'])], "s")
     st.write("3. **Top 5 Piezas Defectuosas**")
     epz_s = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_soldadura'])], conf['grupos_soldadura'], "s")
+    st.divider()
+    if st.button("🖨️ Generar PDF Prod. Soldadura", use_container_width=True, type="primary"):
+        for _, r in ep_s.iterrows():
+            idx = (etp_s['Grupo'] == r['Grupo']) & (etp_s['Mes'] == m_sel)
+            if any(idx): etp_s.loc[idx, ['Totales', 'Scrap', 'RT']] = [r['Totales'], r['Scrap'], r['Retrabajo']]
+            else: etp_s = pd.concat([etp_s, pd.DataFrame([{'Grupo':r['Grupo'], 'Mes':m_sel, 'Mes_Str':MESES_MAP[m_sel], 'Totales':r['Totales'], 'Scrap':r['Scrap'], 'RT':r['Retrabajo']}])], ignore_index=True)
+        with st.spinner("Procesando PDF..."): st.session_state['ps2'] = run_pdf_prod(planta_sel, "Soldadura", l_rep, pd.concat([ep_s]), pd.concat([etp_s]), pd.concat([epz_s]), hs_rt, conf)
+    if 'ps2' in st.session_state: st.download_button("📥 Descargar Prod. Soldadura", st.session_state['ps2'], f"{planta_sel}_PROD_SOLDADURA.pdf", use_container_width=True)
 
 with t_g:
-    st.markdown("### Área: GLOBAL")
+    st.markdown("### REPORTE GLOBAL")
     st.write("1. **KPIs del Mes (OEE)**")
     ek_g = edit_kpi(df_b_oee[df_b_oee['Grupo']=='GLOBAL'], "g")
     st.write("2. **Tendencia Mes a Mes (OEE)**")
@@ -573,49 +609,7 @@ with t_g:
     ep_g = edit_prod(df_b_prod[df_b_prod['Grupo']=='GLOBAL'], "g")
     st.write("4. **Tendencia Mes a Mes (Producción)**")
     etp_g = edit_tprod(df_b_tprod[df_b_tprod['Grupo']=='GLOBAL'], "g")
-
-# --- CONSOLIDACIÓN FINAL PARA EL GENERADOR ---
-df_k_f = pd.concat([ek_e, ek_s, ek_g])
-df_to_f = pd.concat([eto_e, eto_s, eto_g])
-df_fal_f = pd.concat([ef_e, ef_s])
-df_p_f = pd.concat([ep_e, ep_s, ep_g])
-df_tp_f = pd.concat([etp_e, etp_s, etp_g])
-df_pz_f = pd.concat([epz_e, epz_s])
-
-# Sustituir mes actual en la tendencia productiva editada automáticamente
-for _, r in df_p_f.iterrows():
-    idx = (df_tp_f['Grupo'] == r['Grupo']) & (df_tp_f['Mes'] == m_sel)
-    if any(idx): df_tp_f.loc[idx, ['Totales', 'Scrap', 'RT']] = [r['Totales'], r['Scrap'], r['Retrabajo']]
-    else: df_tp_f = pd.concat([df_tp_f, pd.DataFrame([{'Grupo':r['Grupo'], 'Mes':m_sel, 'Mes_Str':MESES_MAP[m_sel], 'Totales':r['Totales'], 'Scrap':r['Scrap'], 'RT':r['Retrabajo']}])], ignore_index=True)
-
-# --- GENERACIÓN ---
-with t_d:
-    st.subheader(f"🖨️ Generar y Descargar ({planta_sel} - {m_sel}/{a_sel})")
-    c1, c2, c3 = st.columns(3)
-    l_rep = f"{m_sel}/{a_sel}"
-    
-    with c1:
-        st.markdown("#### ⚙️ Estampado")
-        if st.button("Generar OEE Estampado", use_container_width=True):
-            with st.spinner("Procesando..."): st.session_state['pe1'] = run_pdf_oee(planta_sel, "Estampado", l_rep, df_k_f, df_to_f, df_fal_f, conf)
-        if 'pe1' in st.session_state: st.download_button("📥 Descargar OEE", st.session_state['pe1'], f"{planta_sel}_OEE_ESTAMPADO.pdf", use_container_width=True)
-
-        if st.button("Generar Prod. Estampado", use_container_width=True):
-            with st.spinner("Procesando..."): st.session_state['pe2'] = run_pdf_prod(planta_sel, "Estampado", l_rep, df_p_f, df_tp_f, df_pz_f, hs_rt, conf)
-        if 'pe2' in st.session_state: st.download_button("📥 Descargar Prod.", st.session_state['pe2'], f"{planta_sel}_PROD_ESTAMPADO.pdf", use_container_width=True)
-
-    with c2:
-        st.markdown("#### 🔥 Soldadura")
-        if st.button("Generar OEE Soldadura", use_container_width=True):
-            with st.spinner("Procesando..."): st.session_state['ps1'] = run_pdf_oee(planta_sel, "Soldadura", l_rep, df_k_f, df_to_f, df_fal_f, conf)
-        if 'ps1' in st.session_state: st.download_button("📥 Descargar OEE", st.session_state['ps1'], f"{planta_sel}_OEE_SOLDADURA.pdf", use_container_width=True)
-
-        if st.button("Generar Prod. Soldadura", use_container_width=True):
-            with st.spinner("Procesando..."): st.session_state['ps2'] = run_pdf_prod(planta_sel, "Soldadura", l_rep, df_p_f, df_tp_f, df_pz_f, hs_rt, conf)
-        if 'ps2' in st.session_state: st.download_button("📥 Descargar Prod.", st.session_state['ps2'], f"{planta_sel}_PROD_SOLDADURA.pdf", use_container_width=True)
-
-    with c3:
-        st.markdown("#### 🌍 Resumen Global")
-        if st.button("Generar PDF Global", use_container_width=True):
-            with st.spinner("Procesando..."): st.session_state['pg'] = run_pdf_oee(planta_sel, "GLOBAL", l_rep, df_k_f, df_to_f, pd.DataFrame(columns=['Grupo','Fallo','Minutos','Categoria']), conf)
-        if 'pg' in st.session_state: st.download_button("📥 Descargar Global", st.session_state['pg'], f"{planta_sel}_GENERAL.pdf", use_container_width=True)
+    st.divider()
+    if st.button("🖨️ Generar PDF Global", use_container_width=True, type="primary"):
+        with st.spinner("Procesando PDF..."): st.session_state['pg'] = run_pdf_oee(planta_sel, "GLOBAL", l_rep, pd.concat([ek_g]), pd.concat([eto_g]), pd.DataFrame(columns=['Grupo','Fallo','Minutos','Categoria']), conf)
+    if 'pg' in st.session_state: st.download_button("📥 Descargar Global", st.session_state['pg'], f"{planta_sel}_GENERAL.pdf", use_container_width=True)
