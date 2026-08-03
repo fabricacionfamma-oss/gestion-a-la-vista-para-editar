@@ -119,7 +119,6 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             q_piezas = f"SELECT c.Name as Máquina, COALESCE(pr.Code, 'S/C') as Pieza, SUM(COALESCE(p.Scrap, 0)) as Scrap, SUM(COALESCE(p.Rework, 0)) as RT FROM PROD_M_01 p JOIN CELL c ON p.CellId = c.CellId LEFT JOIN PRODUCT pr ON p.ProductId = pr.ProductId WHERE p.Year = {anio} AND p.Month = {mes} GROUP BY c.Name, pr.Code"
             q_trend_oee = f"SELECT p.Month, c.Name as Máquina, SUM(COALESCE(p.ProductiveTime, 0)) as T_Operativo, SUM(COALESCE(p.DownTime, 0)) as T_Parada, SUM(COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0)) as T_Planificado, SUM(COALESCE(p.Performance, 0) * COALESCE(p.ProductiveTime, 0)) as Perf_Num, SUM(COALESCE(p.Availability, 0) * (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0))) as Disp_Num, SUM(COALESCE(p.Quality, 0) * (COALESCE(p.Good, 0) + COALESCE(p.Rework, 0) + COALESCE(p.Scrap, 0))) as Cal_Num, SUM(COALESCE(p.Oee, 0) * (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0))) as OEE_Num FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month <= {mes} GROUP BY p.Month, c.Name"
             q_trend_pcs = f"SELECT p.Month, c.Name as Máquina, SUM(COALESCE(p.Good, 0)) as Buenas, SUM(COALESCE(p.Rework, 0)) as Retrabajo, SUM(COALESCE(p.Scrap, 0)) as Observadas, SUM(COALESCE(p.Good, 0) + COALESCE(p.Rework, 0) + COALESCE(p.Scrap, 0)) as Totales FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month <= {mes} GROUP BY p.Month, c.Name"
-            
             q_m06 = f"SELECT 'GLOBAL' as Nivel, 'GLOBAL' as Grupo, Performance, Availability as Disp, Quality as Cal, Oee FROM PROD_M_06 WHERE Year = {anio} AND Month = {mes}"
             q_m05 = f"SELECT 'FABRICA' as Nivel, UPPER(f.Name) as Grupo, p.Performance, p.Availability as Disp, p.Quality as Cal, p.Oee FROM PROD_M_05 p JOIN FACTORY f ON p.FactoryId = f.FactoryId WHERE p.Year = {anio} AND p.Month = {mes}"
             q_m04 = f"SELECT 'LINEA' as Nivel, UPPER(l.Name) as Grupo, p.Performance, p.Availability as Disp, p.Quality as Cal, p.Oee FROM PROD_M_04 p JOIN LINE l ON p.LineId = l.LineId WHERE p.Year = {anio} AND p.Month = {mes}"
@@ -221,7 +220,16 @@ def run_pdf_oee(planta, area, label_rep, df_kpi, df_trend, df_fallos, conf):
     grupos = conf["grupos_estampado"] if area.upper() == "ESTAMPADO" else (conf["grupos_soldadura"] if area.upper() == "SOLDADURA" else conf["grupos_estampado"] + conf["grupos_soldadura"])
     
     pdf = ReportePDF(f"GESTIÓN A LA VISTA - {area}", label_rep, theme_color)
-    paginas = ['GLOBAL'] if area.upper() == "GLOBAL" else [area.upper()] + [g for g in grupos if g in df_kpi['Grupo'].unique()]
+    
+    # Pre-filtrar las páginas que están en 0 absoluto para que no salgan en blanco
+    paginas_base = ['GLOBAL'] if area.upper() == "GLOBAL" else [area.upper()] + [g for g in grupos if g in df_kpi['Grupo'].unique()]
+    paginas = []
+    for tgt in paginas_base:
+        row = df_kpi[df_kpi['Grupo'] == tgt]
+        if row.empty or (row['Oee'].values[0] == 0 and row['Performance'].values[0] == 0 and row['Disp'].values[0] == 0 and row['Cal'].values[0] == 0):
+            continue
+        paginas.append(tgt)
+    if not paginas: paginas = ['GLOBAL'] if area.upper() == "GLOBAL" else [area.upper()] # Fallback
 
     for target in paginas:
         pdf.add_page(orientation='L'); pdf.set_auto_page_break(False); pdf.add_gradient_background()
@@ -305,7 +313,16 @@ def run_pdf_prod(planta, area, label_rep, df_prod, df_tprod, df_pza, hs_rt, conf
     
     pdf = ReportePDF(f"INFORME PRODUCTIVO - {area}", label_rep, theme_color)
     grupos = conf["grupos_estampado"] if area.upper() == "ESTAMPADO" else conf["grupos_soldadura"]
-    paginas = [area.upper()] + [g for g in grupos if g in df_prod['Grupo'].unique()]
+    
+    # Pre-filtrar las páginas que están en 0 absoluto para que no salgan
+    paginas_base = [area.upper()] + [g for g in grupos if g in df_prod['Grupo'].unique()]
+    paginas = []
+    for tgt in paginas_base:
+        row = df_prod[df_prod['Grupo'] == tgt]
+        if row.empty or (row['Totales'].values[0] == 0 and row['Scrap'].values[0] == 0 and row['Retrabajo'].values[0] == 0):
+            continue
+        paginas.append(tgt)
+    if not paginas: paginas = [area.upper()] # Fallback
 
     for target in paginas:
         pdf.add_page(orientation='L'); pdf.set_auto_page_break(False); pdf.add_gradient_background()
@@ -434,6 +451,12 @@ df_b_fallos = pd.DataFrame(columns=['Grupo', 'Fallo', 'Minutos', 'Categoria'])
 if not df_r.empty:
     dtr = df_r[df_r['Estado_Global'] == 'Falla/Gestión'].copy()
     dtr['Grupo'] = dtr['Máquina'].astype(str).str.strip().str.upper().map(mapa).fillna('OTRO')
+    
+    # FILTRO: No mostrar Refrigerio, Baño ni Descanso en las tablas de edición
+    excluir = ['BAÑO', 'BANO', 'REFRIGERIO', 'DESCANSO']
+    mask_puras = ~dtr['Detalle_Final'].astype(str).str.upper().apply(lambda x: any(excl in x for excl in excluir))
+    dtr = dtr[mask_puras]
+
     f_list = []
     for g in ['GLOBAL', 'ESTAMPADO', 'SOLDADURA'] + conf['grupos_estampado'] + conf['grupos_soldadura']:
         d = dtr if g == 'GLOBAL' else (dtr[dtr['Grupo'].isin(conf['grupos_estampado'])] if g == 'ESTAMPADO' else (dtr[dtr['Grupo'].isin(conf['grupos_soldadura'])] if g == 'SOLDADURA' else dtr[dtr['Grupo'] == g]))
