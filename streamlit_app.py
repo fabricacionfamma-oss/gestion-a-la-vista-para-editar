@@ -13,7 +13,6 @@ from datetime import timedelta
 # ==========================================
 st.set_page_config(page_title="Generador de Reportes | Grupo Fumiscor", layout="wide", page_icon="📊")
 
-# --- DICCIONARIOS DE CONFIGURACIÓN POR PLANTA ---
 CONFIG_PLANTAS = {
     "FUMISCOR": {
         "maquinas": {
@@ -53,8 +52,7 @@ CONFIG_PLANTAS = {
             "Cel5 - Rob4 - Respaldo 60/40": "GMS-01 - ROBOT", "HANGERS NISSAN": "GMS-01 - ROBOT"
         },
         "grupos_estampado": ['CORTADORA LASER', 'GME-01 - BALANCIN', 'GME-02 - PRENSA HIDRAULICA', 'GME-03 - PRENSA MECANICA', 'GME-04 - PRENSA PROGRESIVA', 'PRENSAS PROGRESIVAS GRANDES'],
-        "grupos_soldadura": ['GME-05 - DOBLADORA', 'GMS-01 - ROBOT', 'GMS-02 - PRP', 'GMS-03 - COLGANTE', 'GMS-03 - SOLDADORA MANUAL', 'CELDAS NUEVAS'],
-        "map_wiidem": {"BALANCINES": "GME-01 - BALANCIN", "CELDAS RENAULT": "CELDAS NUEVAS", "CELDAS": "GMS-01 - ROBOT"}
+        "grupos_soldadura": ['GME-05 - DOBLADORA', 'GMS-01 - ROBOT', 'GMS-02 - PRP', 'GMS-03 - COLGANTE', 'GMS-03 - SOLDADORA MANUAL', 'CELDAS NUEVAS']
     },
     "FAMMA": {
         "maquinas": {
@@ -70,13 +68,12 @@ CONFIG_PLANTAS = {
             "MIG 1": "MIG", "MIG 2": "MIG"
         },
         "grupos_estampado": ['LINEA 1.2', 'LINEA 1.4', 'LINEA 1.5', 'LINEA 2', 'LINEA 3', 'LINEA 4'],
-        "grupos_soldadura": ['CELDAS', 'PRP', 'MIG'],
-        "map_wiidem": {}
+        "grupos_soldadura": ['CELDAS', 'PRP', 'MIG']
     }
 }
 
 # ==========================================
-# 1. FUNCIONES PDF Y AUXILIARES (COMPARTIDAS)
+# 1. CLASE PDF Y UTILIDADES
 # ==========================================
 class ReportePDF(FPDF):
     def __init__(self, area, fecha_str, theme_color):
@@ -123,16 +120,7 @@ def clean_text(text):
     if pd.isna(text): return "-"
     return str(text).replace('•', '-').replace('➤', '>').encode('latin-1', 'replace').decode('latin-1')
 
-def save_chart(fig, w=600, h=300):
-    fig.update_layout(width=w, height=h, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-        fig.write_image(tmp.name, engine="kaleido", scale=2.5); return tmp.name
-
-# ==========================================
-# 2. GENERADORES DE ESTRUCTURAS (PARA MODO MANUAL)
-# ==========================================
-def generate_empty_schemas(planta_selec):
-    # Genera DataFrames vacíos con las columnas exactas que requieren los motores de PDF
+def generate_empty_schemas():
     df_m = pd.DataFrame(columns=['Máquina', 'Buenas', 'Retrabajo', 'Observadas', 'T_Operativo', 'T_Parada', 'T_Planificado', 'Perf_Num', 'Disp_Num', 'Cal_Num', 'OEE_Num'])
     df_raw = pd.DataFrame(columns=['Máquina', 'Tiempo (Min)', 'Nivel Evento 1', 'Nivel Evento 2', 'Nivel Evento 3', 'Nivel Evento 4', 'Estado_Global', 'Categoria_Macro', 'Detalle_Final'])
     df_trend = pd.DataFrame(columns=['Month', 'Máquina', 'Buenas', 'Retrabajo', 'Observadas', 'Totales', 'T_Operativo', 'T_Parada', 'T_Planificado', 'Perf_Num', 'Disp_Num', 'Cal_Num', 'OEE_Num'])
@@ -144,12 +132,15 @@ def generate_empty_schemas(planta_selec):
     return df_m, df_raw, df_trend, df_piezas, df_oficial, df_t_04, df_t_05, df_t_06
 
 # ==========================================
-# 3. LECTURA SQL
+# 2. OBTENCIÓN DE DATOS (SQL)
 # ==========================================
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
     try:
-        conn = st.connection("wii_bi", type="sql")
+        # CONEXIÓN DINÁMICA BASADA EN LA PLANTA
+        conn_name = "fumiscor" if planta == "FUMISCOR" else "famma"
+        conn = st.connection(conn_name, type="sql")
+        
         ini_str = fecha_ini.strftime('%Y-%m-%d 00:00:00')
         fin_str = fecha_fin.strftime('%Y-%m-%d 23:59:59')
         
@@ -172,12 +163,10 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             df_trend = pd.merge(t_pcs, t_oee, on=['Month', 'Máquina'], how='outer').fillna(0) if not t_pcs.empty else t_oee
             df_oficial = pd.concat([conn.query(q_m06).fillna(0), conn.query(q_m05).fillna(0), conn.query(q_m04).fillna(0)], ignore_index=True)
             
-            # Limpieza Fumiscor Eventos
             if not df_raw.empty:
                 df_raw['Tiempo (Min)'] = pd.to_numeric(df_raw['Tiempo (Min)'], errors='coerce').fillna(0)
                 mask = (df_raw['Nivel Evento 1'].astype(str).str.upper().str.contains('PROYECTO') | df_raw['Nivel Evento 2'].astype(str).str.upper().str.contains('PROYECTO'))
                 df_raw = df_raw[~mask].copy()
-                
                 df_raw['Estado_Global'] = df_raw.apply(lambda r: 'Producción' if 'PRODUC' in str(r.get('Nivel Evento 1','')).upper() else ('Parada Programada' if 'PARADA' in str(r.get('Nivel Evento 1','')).upper() else 'Falla/Gestión'), axis=1)
                 df_raw['Categoria_Macro'] = df_raw.apply(lambda r: 'Gestión' if 'GESTION' in str(r.get('Nivel Evento 1','')).upper() else (str(r.get('Nivel Evento 2','')).title() if 'FALLA' in str(r.get('Nivel Evento 1','')).upper() else 'Otra Falla'), axis=1)
                 df_raw['Detalle_Final'] = df_raw.apply(lambda r: str(r.get('Nivel Evento 4', r.get('Nivel Evento 3', r.get('Nivel Evento 2', 'Sin Detalle')))), axis=1)
@@ -229,12 +218,25 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             return df_metrics, df_raw, df_trend, df_piezas, df_oficial, df_t_04, df_t_05, df_t_06
             
     except Exception as e:
-        st.error(f"Error SQL: {e}")
-        return generate_empty_schemas(planta)
+        st.error(f"Error conectando a SQL ({planta}): {str(e)}")
+        return generate_empty_schemas()
 
 # ==========================================
-# 4. MOTORES DE PDF UNIFICADOS
+# 3. MOTORES DE PDF UNIFICADOS
 # ==========================================
+def render_and_insert_chart(fig, pdf, x, y, w, h_fig=300):
+    """ Función auxiliar para generar imagen y asegurar su limpieza en memoria """
+    fig.update_layout(width=600, height=h_fig, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        fig.write_image(tmp.name, engine="kaleido", scale=2.5)
+        tmp_path = tmp.name
+    
+    try:
+        pdf.image(tmp_path, x, y, w)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 def generar_pdf_oee(planta, area, label_reporte, df_m, df_r, df_t, df_oficial, df_t_04, df_t_05, df_t_06, mes_sel):
     conf = CONFIG_PLANTAS[planta]
     if area.upper() == "ESTAMPADO": theme_color = (15, 76, 129); grupos = conf["grupos_estampado"]
@@ -252,7 +254,6 @@ def generar_pdf_oee(planta, area, label_reporte, df_m, df_r, df_t, df_oficial, d
     pdf = ReportePDF(f"GESTIÓN A LA VISTA - {area}", label_reporte, theme_color)
     paginas = ['GENERAL'] if area.upper() == "GLOBAL" else ['GENERAL'] + [g for g in grupos if g in df_m['Grupo'].unique()]
 
-    # Lógica central idéntica para ambas plantas, delegando en los inputs (df_t vs df_t_04/05/06) la procedencia del histórico
     for target in paginas:
         pdf.add_page(orientation='L'); pdf.set_auto_page_break(False); pdf.add_gradient_background()
         
@@ -312,7 +313,6 @@ def generar_pdf_oee(planta, area, label_reporte, df_m, df_r, df_t, df_oficial, d
                     res.append({'M': int(m), 'V': val/100 if val > 1.5 else val})
 
             df_g = pd.DataFrame(res)
-            # Acumulado
             tp_ytd, to_ytd = df_in['T_Planificado'].sum(), df_in['T_Operativo'].sum()
             ytd = 0
             if col == 'OEE': ytd = (df_in['OEE_Num']*df_in['T_Planificado']).sum()/tp_ytd if tp_ytd>0 else 0
@@ -330,9 +330,8 @@ def generar_pdf_oee(planta, area, label_reporte, df_m, df_r, df_t, df_oficial, d
             if len(df_g) > 1: fig.add_vline(x=len(df_g)-1.5, line_dash="dot")
             fig.update_layout(title=dict(text=f"<b>{title}</b>", font=dict(size=13)), margin=dict(t=35, b=20, l=10, r=10), yaxis=dict(visible=False, range=[0, max(1.1, df_g['V'].max()*1.3) if not df_g.empty else 1]))
             
-            img = save_chart(fig, 600, 300 if is_large else 220); pdf.image(img, x_pos+2, y_pos+2, 134 if is_large else 132); os.remove(img)
+            render_and_insert_chart(fig, pdf, x_pos+2, y_pos+2, 134 if is_large else 132, 300 if is_large else 220)
 
-        # Rendereo de Paneles Trend
         if area.upper() == "GLOBAL":
             pdf.draw_panel(10, 48, 136, 75); pdf.draw_panel(149, 48, 138, 75); add_trend(df_t_t, 'OEE', 'OEE (%)', 10, 48, 0.75, True); add_trend(df_t_t, 'PERFORMANCE', 'PERFORMANCE (%)', 150, 48, 0.90, True)
             pdf.draw_panel(10, 126, 136, 75); pdf.draw_panel(149, 126, 138, 75); add_trend(df_t_t, 'DISPONIBILIDAD', 'DISPONIBILIDAD (%)', 10, 126, 0.88, True); add_trend(df_t_t, 'CALIDAD', 'CALIDAD (%)', 150, 126, 0.95, True)
@@ -355,11 +354,12 @@ def generar_pdf_oee(planta, area, label_reporte, df_m, df_r, df_t, df_oficial, d
                 df_macro['Label'] = df_macro.apply(lambda r: f"{r['Categoria_Macro']} ({r['Tiempo (Min)']/60:.1f}h | {r['%']:.1%})", axis=1)
                 fig_s = px.bar(df_macro, x='%', y=['Pérdidas']*len(df_macro), color='Label', orientation='h', color_discrete_sequence=px.colors.qualitative.Safe)
                 fig_s.update_layout(barmode='stack', legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5, font=dict(size=9), title=""), margin=dict(t=25, b=20, l=10, r=10), xaxis=dict(visible=False, range=[0, 1]), yaxis=dict(visible=False))
-                imgs = save_chart(fig_s, 600, 180); pdf.image(imgs, 151, 158, 134); os.remove(imgs)
+                
+                render_and_insert_chart(fig_s, pdf, 151, 158, 134, 180)
 
     return pdf.output(dest='S').encode('latin-1')
 
-def generar_pdf_prod(planta, area, label_reporte, df_t, df_p, mes_sel, anio_sel, hs_rt, df_prod_editado, df_piezas_editado):
+def generar_pdf_prod(planta, area, label_reporte, df_t, df_p, mes_sel, hs_rt, df_prod_editado, df_piezas_editado):
     conf = CONFIG_PLANTAS[planta]
     theme_color = (15, 76, 129) if area.upper() == "ESTAMPADO" else (211, 84, 0)
     target_scrap = 0.50 if area.upper() == "ESTAMPADO" else 0.30
@@ -415,7 +415,8 @@ def generar_pdf_prod(planta, area, label_reporte, df_t, df_p, mes_sel, anio_sel,
             fig = go.Figure(go.Bar(x=df_ev['Mes'], y=df_ev[y_col], marker_color=color, text=df_ev[y_col], texttemplate='<b>%{text:.2f}%</b>' if is_pct else '<b>%{text:.3s}</b>', textposition='outside'))
             if tgt: fig.add_hline(y=tgt, line_dash="dash", line_color="#E74C3C", annotation_text=f"Obj: {tgt}%")
             fig.update_layout(title=dict(text=f"<b>{title}</b>", font=dict(size=14), x=0.5, xanchor='center'), margin=dict(t=35, b=20, l=10, r=10), yaxis=dict(visible=False, range=[0, max(tgt*1.5 if tgt else 0, df_ev[y_col].max()*1.3) if not df_ev.empty else 1]), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            img = save_chart(fig, 600, 240); pdf.image(img, 11, y_pos, 133); os.remove(img)
+            
+            render_and_insert_chart(fig, pdf, 11, y_pos, 133, 240)
 
         pdf.draw_panel(10, 20, 135, 58); add_p_chart('Totales', 'PIEZAS TOTALES', 22, None, False)
         pdf.draw_panel(10, 82, 135, 58); add_p_chart('% Scrap', '% SCRAP', 84, target_scrap, True)
@@ -431,7 +432,8 @@ def generar_pdf_prod(planta, area, label_reporte, df_t, df_p, mes_sel, anio_sel,
                     f = px.bar(df_plot, x=col, y='Pieza', orientation='h', title=f"<b>{title}</b>", color_discrete_sequence=bar_color)
                     f.update_layout(title=dict(font=dict(size=14), x=0.5, xanchor='center'), margin=dict(t=40, b=20, l=120, r=45), xaxis=dict(visible=False), yaxis=dict(title="", type='category', tickfont=dict(size=10)), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
                     f.update_traces(texttemplate='<b>%{x}</b>', textposition='outside', cliponaxis=False)
-                    img = save_chart(f, 600, 360); pdf.image(img, 151, y_pos + 1, 133); os.remove(img)
+                    
+                    render_and_insert_chart(f, pdf, 151, y_pos + 1, 133, 360)
 
         if target == 'GENERAL' and area.upper() == 'ESTAMPADO':
             pdf.draw_panel(150, 199, 135, 10, 2, (240, 240, 240)); pdf.set_xy(150, 199); pdf.set_font("Arial", 'B', 10); pdf.set_text_color(50, 50, 50); pdf.cell(67.5, 10, "HS RE-TRABAJO TOTAL:", 0, 0, 'C'); pdf.set_text_color(*theme_color); pdf.set_font("Arial", 'B', 11); pdf.cell(67.5, 10, f"{hs_rt:.1f} hs", 0, 1, 'C')
@@ -439,39 +441,34 @@ def generar_pdf_prod(planta, area, label_reporte, df_t, df_p, mes_sel, anio_sel,
     return pdf.output(dest='S').encode('latin-1')
 
 # ==========================================
-# 5. UI STREAMLIT APP
+# 4. APP STREAMLIT (UI)
 # ==========================================
 st.title("🖨️ Generador Unificado de Reportes")
 st.markdown("Selecciona los parámetros y visualiza las tablas interactivas. Luego de confirmar los datos, descarga los PDFs listos para presentar.")
 
-# --- SIDEBAR DE CONFIGURACIÓN ---
 with st.sidebar:
     st.header("🔧 Parámetros")
     planta_sel = st.selectbox("Seleccionar Planta", ["FUMISCOR", "FAMMA"])
     modo_datos = st.radio("Origen de Datos", ["📊 Automático (Wiidem SQL)", "📝 Manual (Plantillas Vacías)"])
-    
     st.divider()
     m_sel = st.selectbox("Mes", range(1, 13), index=pd.Timestamp.now().month-1)
     a_sel = st.selectbox("Año", [2024, 2025, 2026], index=2)
-    
     st.divider()
     hs_rt = st.number_input("Horas Extras RT (Estampado):", 0.0, 1000.0, 0.0)
 
-# --- OBTENCIÓN DE DATOS ---
-with st.spinner(f"Obteniendo datos de {planta_sel}..."):
+with st.spinner(f"Sincronizando {planta_sel}..."):
     ini = pd.to_datetime(f"{a_sel}-{m_sel}-01")
     fin = ini + pd.offsets.MonthEnd(0)
     
     if "Automático" in modo_datos:
         df_m, df_r, df_t, df_p, df_oficial, df_t_04, df_t_05, df_t_06 = fetch_data_from_db(planta_sel, ini, fin, m_sel, a_sel)
     else:
-        df_m, df_r, df_t, df_p, df_oficial, df_t_04, df_t_05, df_t_06 = generate_empty_schemas(planta_sel)
+        df_m, df_r, df_t, df_p, df_oficial, df_t_04, df_t_05, df_t_06 = generate_empty_schemas()
 
-# --- PROCESAMIENTO BASE PARA TABLAS EDITABLES ---
 conf = CONFIG_PLANTAS[planta_sel]
 mapa = {str(k).strip().upper(): str(v).strip().upper() for k, v in conf["maquinas"].items()}
 
-# OEE Base
+# --- BASE EDITORES ---
 df_base_oee = pd.DataFrame()
 if not df_m.empty:
     df_temp = df_m.copy()
@@ -499,7 +496,6 @@ elif df_base_oee.empty:
     est = [{'Nivel':'GLOBAL','Grupo':'GLOBAL'}, {'Nivel':'FABRICA','Grupo':'ESTAMPADO'}, {'Nivel':'FABRICA','Grupo':'SOLDADURA'}] + [{'Nivel':'LINEA','Grupo':g} for g in conf["grupos_estampado"]+conf["grupos_soldadura"]]
     df_base_oee = pd.DataFrame(est); df_base_oee[['Performance','Disp','Cal','Oee']] = 0.0
 
-# PROD Base
 df_base_prod = pd.DataFrame()
 if not df_t.empty:
     df_temp2 = df_t[df_t['Month'] == m_sel].copy()
@@ -513,7 +509,6 @@ else:
     est2 = [{'Nivel':'GLOBAL','Grupo':'GLOBAL'}, {'Nivel':'FABRICA','Grupo':'ESTAMPADO'}, {'Nivel':'FABRICA','Grupo':'SOLDADURA'}] + [{'Nivel':'LINEA','Grupo':g} for g in conf["grupos_estampado"]+conf["grupos_soldadura"]]
     df_base_prod = pd.DataFrame(est2); df_base_prod[['Totales','Scrap','Retrabajo']] = 0
 
-# PIEZAS Base
 df_base_piezas = pd.DataFrame(columns=['Grupo','Pieza','Scrap','RT'])
 if not df_p.empty:
     df_temp3 = df_p.copy()
@@ -521,12 +516,11 @@ if not df_p.empty:
     df_temp3['Pieza'] = df_temp3['Pieza'].astype(str).fillna('S/C')
     df_base_piezas = df_temp3.groupby(['Grupo','Pieza'])[['Scrap','RT']].sum().reset_index()
 
-# --- TABS DE LA INTERFAZ ---
+# --- INTERFAZ TABS ---
 tab1, tab2, tab3 = st.tabs(["⚙️ OEE y Disponibilidad", "🏭 Producción y Calidades", "🖨️ Generar y Descargar"])
 
 with tab1:
     st.subheader(f"Edición de KPIs ({planta_sel})")
-    st.info("Los valores pre-cargados provienen del sistema. Puedes modificarlos manualmente antes de generar el PDF.")
     df_oficial_editado = st.data_editor(df_base_oee, use_container_width=True, hide_index=True, column_config={
         "Nivel": st.column_config.TextColumn("Nivel", disabled=True), "Grupo": st.column_config.TextColumn("Grupo", disabled=True),
         "Performance": st.column_config.NumberColumn("Performance", format="%.2f", step=0.01),
@@ -545,7 +539,6 @@ with tab2:
         })
     with col_p2:
         st.subheader("Top 5 Defectos por Pieza")
-        st.info("Modifica para reflejar los gráficos de Top 5 Scrap y Re-trabajo.")
         df_piezas_editado = st.data_editor(df_base_piezas, use_container_width=True, hide_index=True, num_rows="dynamic", column_config={
             "Grupo": st.column_config.SelectboxColumn("Grupo", options=conf["grupos_estampado"]+conf["grupos_soldadura"]),
             "Pieza": st.column_config.TextColumn("Pieza"),
@@ -571,11 +564,11 @@ with tab3:
     with col_down2:
         st.markdown("### 🏭 Informe Productivo")
         if st.button("Preparar Prod. Estampado", use_container_width=True):
-            with st.spinner("Generando..."): st.session_state['pr_e'] = generar_pdf_prod(planta_sel, "Estampado", label_rep, df_t, df_p, m_sel, a_sel, hs_rt, df_prod_editado, df_piezas_editado)
+            with st.spinner("Generando..."): st.session_state['pr_e'] = generar_pdf_prod(planta_sel, "Estampado", label_rep, df_t, df_p, m_sel, hs_rt, df_prod_editado, df_piezas_editado)
         if 'pr_e' in st.session_state: st.download_button("📥 Descargar Prod. Estampado", st.session_state['pr_e'], f"{planta_sel}_Productivo_Vista_ESTAMPADO.pdf", use_container_width=True)
 
         if st.button("Preparar Prod. Soldadura", use_container_width=True):
-            with st.spinner("Generando..."): st.session_state['pr_s'] = generar_pdf_prod(planta_sel, "Soldadura", label_rep, df_t, df_p, m_sel, a_sel, hs_rt, df_prod_editado, df_piezas_editado)
+            with st.spinner("Generando..."): st.session_state['pr_s'] = generar_pdf_prod(planta_sel, "Soldadura", label_rep, df_t, df_p, m_sel, hs_rt, df_prod_editado, df_piezas_editado)
         if 'pr_s' in st.session_state: st.download_button("📥 Descargar Prod. Soldadura", st.session_state['pr_s'], f"{planta_sel}_Productivo_Vista_SOLDADURA.pdf", use_container_width=True)
 
     with col_down3:
