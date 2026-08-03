@@ -4,7 +4,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import tempfile
 import os
+import calendar
 from fpdf import FPDF
+from datetime import timedelta
 
 # ==========================================
 # 0. CONFIGURACIÓN Y CONSTANTES
@@ -131,11 +133,28 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             
             if not df_r.empty:
                 df_r['Tiempo (Min)'] = pd.to_numeric(df_r['Tiempo (Min)'], errors='coerce').fillna(0)
-                mask = (df_r['Nivel Evento 1'].astype(str).str.upper().str.contains('PROYECTO') | df_r['Nivel Evento 2'].astype(str).str.upper().str.contains('PROYECTO'))
+                
+                # LIMPIEZA AGRESIVA DE NANs
+                for c in ['Nivel Evento 1', 'Nivel Evento 2', 'Nivel Evento 3', 'Nivel Evento 4']:
+                    df_r[c] = df_r[c].astype(str).replace(['nan', 'None', 'NaN'], '').str.strip()
+
+                mask = (df_r['Nivel Evento 1'].str.upper().str.contains('PROYECTO') | df_r['Nivel Evento 2'].str.upper().str.contains('PROYECTO'))
                 df_r = df_r[~mask].copy()
                 df_r['Estado_Global'] = df_r.apply(lambda r: 'Producción' if 'PRODUC' in str(r.get('Nivel Evento 1','')).upper() else ('Parada Programada' if 'PARADA' in str(r.get('Nivel Evento 1','')).upper() else 'Falla/Gestión'), axis=1)
-                df_r['Categoria_Macro'] = df_r.apply(lambda r: 'Gestión' if 'GESTION' in str(r.get('Nivel Evento 1','')).upper() else (str(r.get('Nivel Evento 2','')).title() if 'FALLA' in str(r.get('Nivel Evento 1','')).upper() else 'Otra Falla'), axis=1)
-                df_r['Detalle_Final'] = df_r.apply(lambda r: str(r.get('Nivel Evento 4', r.get('Nivel Evento 3', r.get('Nivel Evento 2', 'Sin Detalle')))), axis=1)
+                
+                def get_cat(r):
+                    n1 = str(r.get('Nivel Evento 1', '')).upper()
+                    n2 = str(r.get('Nivel Evento 2', '')).title()
+                    if 'GESTION' in n1 or 'GESTIÓN' in n1: return 'Gestión'
+                    if 'FALLA' in n1: return n2 if n2 else 'Otra Falla'
+                    return n1.title() if n1 else 'Sin Categoría'
+                df_r['Categoria_Macro'] = df_r.apply(get_cat, axis=1)
+                
+                def get_det(r):
+                    for lvl in ['Nivel Evento 4', 'Nivel Evento 3', 'Nivel Evento 2', 'Nivel Evento 1']:
+                        if r.get(lvl): return r[lvl]
+                    return 'Sin Detalle'
+                df_r['Detalle_Final'] = df_r.apply(get_det, axis=1)
 
             return df_m, df_r, df_t, df_p, df_o, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -143,6 +162,7 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             q_oee_m = f"SELECT c.Name as Máquina, p.Performance as Perf_Num, p.Availability as Disp_Num, p.Quality as Cal_Num, p.Oee as OEE_Num, COALESCE(p.ProductiveTime, 0) as T_Operativo, (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0)) as T_Planificado FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month = {mes}"
             q_pcs_m = f"SELECT c.Name as Máquina, SUM(COALESCE(p.Good, 0)) as Buenas, SUM(COALESCE(p.Rework, 0)) as Retrabajo, SUM(COALESCE(p.Scrap, 0)) as Observadas FROM PROD_M_01 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month = {mes} GROUP BY c.Name"
             df_m = pd.merge(conn.query(q_oee_m).fillna(0), conn.query(q_pcs_m).fillna(0), on='Máquina', how='outer').fillna(0)
+
             df_p = conn.query(f"SELECT c.Name as Máquina, COALESCE(pr.Code, 'S/C') as Pieza, SUM(COALESCE(p.Scrap, 0)) as Scrap, SUM(COALESCE(p.Rework, 0)) as RT FROM PROD_M_01 p JOIN CELL c ON p.CellId = c.CellId LEFT JOIN PRODUCT pr ON p.ProductId = pr.ProductId WHERE p.Year = {anio} AND p.Month = {mes} GROUP BY c.Name, pr.Code").fillna(0)
             
             t_oee = conn.query(f"SELECT p.Month, c.Name as Máquina, p.Performance as Perf_Num, p.Availability as Disp_Num, p.Quality as Cal_Num, p.Oee as OEE_Num, COALESCE(p.ProductiveTime, 0) as T_Operativo, (COALESCE(p.ProductiveTime, 0) + COALESCE(p.DownTime, 0)) as T_Planificado FROM PROD_M_03 p JOIN CELL c ON p.CellId = c.CellId WHERE p.Year = {anio} AND p.Month <= {mes}").fillna(0)
@@ -151,7 +171,12 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
             
             q_ev = f"SELECT c.Name as Máquina, e.Interval as [Tiempo (Min)], t1.Name as [Nivel Evento 1], t2.Name as [Nivel Evento 2], t3.Name as [Nivel Evento 3], t4.Name as [Nivel Evento 4], t5.Name as [Nivel Evento 5], t6.Name as [Nivel Evento 6] FROM EVENT_01 e JOIN CELL c ON e.CellId = c.CellId LEFT JOIN EVENTTYPE t1 ON e.EventTypeLevel1 = t1.EventTypeId LEFT JOIN EVENTTYPE t2 ON e.EventTypeLevel2 = t2.EventTypeId LEFT JOIN EVENTTYPE t3 ON e.EventTypeLevel3 = t3.EventTypeId LEFT JOIN EVENTTYPE t4 ON e.EventTypeLevel4 = t4.EventTypeId LEFT JOIN EVENTTYPE t5 ON e.EventTypeLevel5 = t5.EventTypeId LEFT JOIN EVENTTYPE t6 ON e.EventTypeLevel6 = t6.EventTypeId WHERE e.Date BETWEEN '{ini_str}' AND '{fin_str}'"
             df_r = conn.query(q_ev)
+            
             if not df_r.empty:
+                for i in range(1, 7):
+                    c = f'Nivel Evento {i}'
+                    if c in df_r.columns: df_r[c] = df_r[c].astype(str).replace(['nan', 'None', 'NaN'], '').str.strip()
+
                 def parse_ev(row):
                     n = [str(row.get(f'Nivel Evento {i}', '')).strip().upper() for i in range(1, 7)]
                     v = [x for x in n if x and x not in ['NONE', 'NAN', 'NULL']]
@@ -287,7 +312,7 @@ def run_pdf_prod(planta, area, label_rep, df_prod, df_tprod, df_pza, hs_rt, conf
         pdf.cell(40, 6, "PRODUCTIVO", 1, 1, 'C', True)
 
         df_g_tprod = df_tprod[df_tprod['Grupo'] == target].sort_values('Mes').copy()
-        # Recalcular porcentajes on the fly por si modificaron Totales o Scrap
+        # Recalcular porcentajes dinámicamente si el usuario editó las cantidades
         df_g_tprod['Scrap_pct'] = (df_g_tprod['Scrap'] / df_g_tprod['Totales'].replace(0,1)) * 100
         df_g_tprod['RT_pct'] = (df_g_tprod['RT'] / df_g_tprod['Totales'].replace(0,1)) * 100
         
@@ -333,8 +358,9 @@ st.title("🖨️ Generador de Reportes (Data & Layout Editor)")
 st.markdown("Los datos vienen directamente de **SQL**. Revisa y edita las tablas por área antes de generar los PDFs.")
 
 with st.sidebar:
-    st.header("🔧 Parámetros")
-    planta_sel = st.selectbox("Planta", ["FUMISCOR", "FAMMA"])
+    st.header("🔧 Parámetros Generales")
+    planta_sel = st.selectbox("Seleccionar Planta", ["FUMISCOR", "FAMMA"])
+    st.divider()
     m_sel = st.selectbox("Mes", range(1, 13), index=pd.Timestamp.now().month-1)
     a_sel = st.selectbox("Año", [2024, 2025, 2026], index=2)
     st.divider()
@@ -356,11 +382,20 @@ if not df_m.empty:
     dt['Grupo'] = dt['Máquina'].astype(str).str.strip().str.upper().map(mapa).fillna('OTRO')
     def cr(name, niv, data):
         if data.empty: return {'Nivel':niv, 'Grupo':name, 'Performance':0.0, 'Disp':0.0, 'Cal':0.0, 'Oee':0.0}
-        tp, to = data['T_Planificado'].sum(), data['T_Operativo'].sum()
-        vo = (data['OEE_Num']*data['T_Planificado']).sum()/tp if tp>0 else 0
-        vd = (data['Disp_Num']*data['T_Planificado']).sum()/tp if tp>0 else 0
-        vp = (data['Perf_Num']*data['T_Operativo']).sum()/to if to>0 else 0
-        vc = (data['Cal_Num']*data['T_Operativo']).sum()/to if to>0 else 0
+        if planta_sel == 'FUMISCOR':
+            tp, to = data['T_Planificado'].sum(), data['T_Operativo'].sum()
+            tpz = data['Buenas'].sum() + data['Retrabajo'].sum() + data['Observadas'].sum() if 'Buenas' in data.columns else 1
+            vo = data['OEE_Num'].sum() / tp if tp > 0 else 0
+            vd = data['Disp_Num'].sum() / tp if tp > 0 else 0
+            vp = data['Perf_Num'].sum() / to if to > 0 else 0
+            vc = data['Cal_Num'].sum() / tpz if tpz > 0 else 0
+        else: # FAMMA
+            tp, to = data['T_Planificado'].sum(), data['T_Operativo'].sum()
+            vo = (data['OEE_Num'] * data['T_Planificado']).sum() / tp if tp > 0 else 0
+            vd = (data['Disp_Num'] * data['T_Planificado']).sum() / tp if tp > 0 else 0
+            vp = (data['Perf_Num'] * data['T_Operativo']).sum() / to if to > 0 else 0
+            vc = (data['Cal_Num'] * data['T_Operativo']).sum() / to if to > 0 else 0
+            
         return {'Nivel':niv, 'Grupo':name, 'Performance':(vp*100 if vp<=1.5 else vp), 'Disp':(vd*100 if vd<=1.5 else vd), 'Cal':(vc*100 if vc<=1.5 else vc), 'Oee':(vo*100 if vo<=1.5 else vo)}
     
     r_kpi = [cr('GLOBAL','GLOBAL', dt), cr('ESTAMPADO','FABRICA', dt[dt['Grupo'].isin(conf["grupos_estampado"])]), cr('SOLDADURA','FABRICA', dt[dt['Grupo'].isin(conf["grupos_soldadura"])])]
@@ -410,10 +445,11 @@ if planta_sel == 'FUMISCOR' and not df_t.empty:
     def cto(g_name, d):
         for m, grp in d.groupby('Month'):
             tp, to = grp['T_Planificado'].sum(), grp['T_Operativo'].sum()
-            vo = (grp['OEE_Num']*grp['T_Planificado']).sum()/tp if tp>0 else 0
-            vp = (grp['Perf_Num']*grp['T_Operativo']).sum()/to if to>0 else 0
-            vd = (grp['Disp_Num']*grp['T_Planificado']).sum()/tp if tp>0 else 0
-            vc = (grp['Cal_Num']*grp['T_Operativo']).sum()/to if to>0 else 0
+            tpz = grp['Buenas'].sum() + grp['Retrabajo'].sum() + grp['Observadas'].sum() if 'Buenas' in grp.columns else 1
+            vo = grp['OEE_Num'].sum() / tp if tp > 0 else 0
+            vp = grp['Perf_Num'].sum() / to if to > 0 else 0
+            vd = grp['Disp_Num'].sum() / tp if tp > 0 else 0
+            vc = grp['Cal_Num'].sum() / tpz if tpz > 0 else 0
             res_toee.append({'Grupo': g_name, 'Mes': int(m), 'Mes_Str': MESES_MAP[int(m)], 'OEE': vo*100 if vo<=1.5 else vo, 'Performance': vp*100 if vp<=1.5 else vp, 'Disponibilidad': vd*100 if vd<=1.5 else vd, 'Calidad': vc*100 if vc<=1.5 else vc})
     cto('GLOBAL', dtm); cto('ESTAMPADO', dtm[dtm['Grupo'].isin(conf['grupos_estampado'])]); cto('SOLDADURA', dtm[dtm['Grupo'].isin(conf['grupos_soldadura'])])
     for g in conf['grupos_estampado'] + conf['grupos_soldadura']: cto(g, dtm[dtm['Grupo'] == g])
@@ -449,23 +485,23 @@ if not df_p.empty:
 def edit_kpi(df, key):
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"kpi_{key}", column_config={
         "Nivel": st.column_config.TextColumn(disabled=True), "Grupo": st.column_config.TextColumn("Línea/Grupo", disabled=True),
-        "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f", step=0.01), "Disp": st.column_config.NumberColumn("Disponibilidad (%)", format="%.2f", step=0.01),
-        "Cal": st.column_config.NumberColumn("Calidad (%)", format="%.2f", step=0.01), "Oee": st.column_config.NumberColumn("OEE (%)", format="%.2f", step=0.01)
+        "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01), "Disp": st.column_config.NumberColumn("Disponibilidad (%)", format="%.2f%%", step=0.01),
+        "Cal": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01), "Oee": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01)
     })
 
 def edit_toee(df, key):
     if df.empty: return pd.DataFrame(columns=['Grupo', 'Mes', 'Mes_Str', 'OEE', 'Performance', 'Disponibilidad', 'Calidad'])
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"toee_{key}", column_config={
         "Grupo": st.column_config.TextColumn(disabled=True), "Mes": st.column_config.NumberColumn(disabled=True), "Mes_Str": st.column_config.TextColumn("Mes", disabled=True),
-        "OEE": st.column_config.NumberColumn("OEE (%)", format="%.2f", step=0.01), "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f", step=0.01),
-        "Disponibilidad": st.column_config.NumberColumn("Disp. (%)", format="%.2f", step=0.01), "Calidad": st.column_config.NumberColumn("Calidad (%)", format="%.2f", step=0.01)
+        "OEE": st.column_config.NumberColumn("OEE (%)", format="%.2f%%", step=0.01), "Performance": st.column_config.NumberColumn("Performance (%)", format="%.2f%%", step=0.01),
+        "Disponibilidad": st.column_config.NumberColumn("Disp. (%)", format="%.2f%%", step=0.01), "Calidad": st.column_config.NumberColumn("Calidad (%)", format="%.2f%%", step=0.01)
     })
 
 def edit_fallos(df, key):
     if df.empty: return pd.DataFrame(columns=['Grupo', 'Fallo', 'Minutos', 'Categoria'])
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"fallos_{key}", num_rows="dynamic", column_config={
         "Grupo": st.column_config.TextColumn(disabled=True), "Fallo": st.column_config.TextColumn("Defecto / Parada"),
-        "Minutos": st.column_config.NumberColumn("Minutos", step=1), "Categoria": st.column_config.TextColumn("Categoría Macro")
+        "Categoria": st.column_config.TextColumn("Categoría Macro"), "Minutos": st.column_config.NumberColumn("Minutos", step=1)
     })
 
 def edit_prod(df, key):
@@ -476,7 +512,7 @@ def edit_prod(df, key):
 
 def edit_tprod(df, key):
     if df.empty: return pd.DataFrame(columns=['Grupo', 'Mes', 'Mes_Str', 'Totales', 'Scrap', 'RT'])
-    st.info("💡 Edita las cantidades base (Totales y Scrap). El sistema calculará los % de Scrap y RT para los gráficos del PDF.")
+    st.info("💡 Edita las cantidades base. El sistema calculará automáticamente los % de Scrap y RT para los gráficos.")
     return st.data_editor(df, use_container_width=True, hide_index=True, key=f"tprod_{key}", column_config={
         "Grupo": st.column_config.TextColumn(disabled=True), "Mes": st.column_config.NumberColumn(disabled=True), "Mes_Str": st.column_config.TextColumn("Mes", disabled=True),
         "Totales": st.column_config.NumberColumn("Totales", step=1), "Scrap": st.column_config.NumberColumn("Scrap (Cant)", step=1), "RT": st.column_config.NumberColumn("RT (Cant)", step=1)
@@ -488,58 +524,57 @@ def edit_pza(df, grps, key):
         "Scrap": st.column_config.NumberColumn("Scrap (Cant)", step=1), "RT": st.column_config.NumberColumn("Re-Trabajo (Cant)", step=1)
     })
 
-# --- INTERFAZ TABS ---
-te, ts, tg, td = st.tabs(["⚙️ ESTAMPADO", "🔥 SOLDADURA", "🌍 GLOBAL", "🖨️ Exportar PDFs"])
+# --- INTERFAZ TABS 6 ---
+t_oe, t_os, t_pe, t_ps, t_g, t_d = st.tabs(["⚙️ OEE Estamp.", "🔥 OEE Sold.", "🏭 Prod. Estamp.", "🏭 Prod. Sold.", "🌍 Global", "🖨️ Exportar PDFs"])
 
-with te:
-    st.markdown("### Área: ESTAMPADO")
-    with st.expander("📊 Gestión OEE (Estampado)", expanded=True):
-        st.write("1. **KPIs del Mes**")
-        ek_e = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='ESTAMPADO') | df_b_oee['Grupo'].isin(conf['grupos_estampado'])], "e")
-        st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
-        eto_e = edit_toee(df_b_toee[(df_b_toee['Grupo']=='ESTAMPADO') | df_b_toee['Grupo'].isin(conf['grupos_estampado'])], "e")
-        st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
-        ef_e = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='ESTAMPADO') | df_b_fallos['Grupo'].isin(conf['grupos_estampado'])], "e")
-        
-    with st.expander("🏭 Informe Productivo (Estampado)", expanded=True):
-        st.write("1. **Cantidades del Mes**")
-        ep_e = edit_prod(df_b_prod[(df_b_prod['Grupo']=='ESTAMPADO') | df_b_prod['Grupo'].isin(conf['grupos_estampado'])], "e")
-        st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
-        etp_e = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='ESTAMPADO') | df_b_tprod['Grupo'].isin(conf['grupos_estampado'])], "e")
-        st.write("3. **Top 5 Piezas Defectuosas**")
-        epz_e = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_estampado'])], conf['grupos_estampado'], "e")
+with t_oe:
+    st.markdown("### Área: ESTAMPADO - GESTIÓN A LA VISTA (OEE)")
+    st.write("1. **KPIs del Mes**")
+    ek_e = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='ESTAMPADO') | df_b_oee['Grupo'].isin(conf['grupos_estampado'])], "e")
+    st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
+    eto_e = edit_toee(df_b_toee[(df_b_toee['Grupo']=='ESTAMPADO') | df_b_toee['Grupo'].isin(conf['grupos_estampado'])], "e")
+    st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
+    ef_e = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='ESTAMPADO') | df_b_fallos['Grupo'].isin(conf['grupos_estampado'])], "e")
 
-with ts:
-    st.markdown("### Área: SOLDADURA")
-    with st.expander("📊 Gestión OEE (Soldadura)", expanded=True):
-        st.write("1. **KPIs del Mes**")
-        ek_s = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='SOLDADURA') | df_b_oee['Grupo'].isin(conf['grupos_soldadura'])], "s")
-        st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
-        eto_s = edit_toee(df_b_toee[(df_b_toee['Grupo']=='SOLDADURA') | df_b_toee['Grupo'].isin(conf['grupos_soldadura'])], "s")
-        st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
-        ef_s = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='SOLDADURA') | df_b_fallos['Grupo'].isin(conf['grupos_soldadura'])], "s")
-        
-    with st.expander("🏭 Informe Productivo (Soldadura)", expanded=True):
-        st.write("1. **Cantidades del Mes**")
-        ep_s = edit_prod(df_b_prod[(df_b_prod['Grupo']=='SOLDADURA') | df_b_prod['Grupo'].isin(conf['grupos_soldadura'])], "s")
-        st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
-        etp_s = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='SOLDADURA') | df_b_tprod['Grupo'].isin(conf['grupos_soldadura'])], "s")
-        st.write("3. **Top 5 Piezas Defectuosas**")
-        epz_s = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_soldadura'])], conf['grupos_soldadura'], "s")
+with t_os:
+    st.markdown("### Área: SOLDADURA - GESTIÓN A LA VISTA (OEE)")
+    st.write("1. **KPIs del Mes**")
+    ek_s = edit_kpi(df_b_oee[(df_b_oee['Grupo']=='SOLDADURA') | df_b_oee['Grupo'].isin(conf['grupos_soldadura'])], "s")
+    st.write("2. **Tendencia Mes a Mes (Gráficos de Barras)**")
+    eto_s = edit_toee(df_b_toee[(df_b_toee['Grupo']=='SOLDADURA') | df_b_toee['Grupo'].isin(conf['grupos_soldadura'])], "s")
+    st.write("3. **Principales Fallos (Top 5 y Gráfico de Torta)**")
+    ef_s = edit_fallos(df_b_fallos[(df_b_fallos['Grupo']=='SOLDADURA') | df_b_fallos['Grupo'].isin(conf['grupos_soldadura'])], "s")
 
-with tg:
+with t_pe:
+    st.markdown("### Área: ESTAMPADO - INFORME PRODUCTIVO")
+    st.write("1. **Cantidades del Mes**")
+    ep_e = edit_prod(df_b_prod[(df_b_prod['Grupo']=='ESTAMPADO') | df_b_prod['Grupo'].isin(conf['grupos_estampado'])], "e")
+    st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
+    etp_e = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='ESTAMPADO') | df_b_tprod['Grupo'].isin(conf['grupos_estampado'])], "e")
+    st.write("3. **Top 5 Piezas Defectuosas**")
+    epz_e = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_estampado'])], conf['grupos_estampado'], "e")
+
+with t_ps:
+    st.markdown("### Área: SOLDADURA - INFORME PRODUCTIVO")
+    st.write("1. **Cantidades del Mes**")
+    ep_s = edit_prod(df_b_prod[(df_b_prod['Grupo']=='SOLDADURA') | df_b_prod['Grupo'].isin(conf['grupos_soldadura'])], "s")
+    st.write("2. **Tendencia Mes a Mes (Cantidades para Gráficos)**")
+    etp_s = edit_tprod(df_b_tprod[(df_b_tprod['Grupo']=='SOLDADURA') | df_b_tprod['Grupo'].isin(conf['grupos_soldadura'])], "s")
+    st.write("3. **Top 5 Piezas Defectuosas**")
+    epz_s = edit_pza(df_b_pza[df_b_pza['Grupo'].isin(conf['grupos_soldadura'])], conf['grupos_soldadura'], "s")
+
+with t_g:
     st.markdown("### Área: GLOBAL")
-    with st.expander("🌍 Resumen Global (Gestión y Producción)", expanded=True):
-        st.write("1. **KPIs del Mes (OEE)**")
-        ek_g = edit_kpi(df_b_oee[df_b_oee['Grupo']=='GLOBAL'], "g")
-        st.write("2. **Tendencia Mes a Mes (OEE)**")
-        eto_g = edit_toee(df_b_toee[df_b_toee['Grupo']=='GLOBAL'], "g")
-        st.write("3. **Cantidades del Mes (Producción)**")
-        ep_g = edit_prod(df_b_prod[df_b_prod['Grupo']=='GLOBAL'], "g")
-        st.write("4. **Tendencia Mes a Mes (Producción)**")
-        etp_g = edit_tprod(df_b_tprod[df_b_tprod['Grupo']=='GLOBAL'], "g")
+    st.write("1. **KPIs del Mes (OEE)**")
+    ek_g = edit_kpi(df_b_oee[df_b_oee['Grupo']=='GLOBAL'], "g")
+    st.write("2. **Tendencia Mes a Mes (OEE)**")
+    eto_g = edit_toee(df_b_toee[df_b_toee['Grupo']=='GLOBAL'], "g")
+    st.write("3. **Cantidades del Mes (Producción)**")
+    ep_g = edit_prod(df_b_prod[df_b_prod['Grupo']=='GLOBAL'], "g")
+    st.write("4. **Tendencia Mes a Mes (Producción)**")
+    etp_g = edit_tprod(df_b_tprod[df_b_tprod['Grupo']=='GLOBAL'], "g")
 
-# --- CONSOLIDACIÓN ---
+# --- CONSOLIDACIÓN FINAL PARA EL GENERADOR ---
 df_k_f = pd.concat([ek_e, ek_s, ek_g])
 df_to_f = pd.concat([eto_e, eto_s, eto_g])
 df_fal_f = pd.concat([ef_e, ef_s])
@@ -547,14 +582,14 @@ df_p_f = pd.concat([ep_e, ep_s, ep_g])
 df_tp_f = pd.concat([etp_e, etp_s, etp_g])
 df_pz_f = pd.concat([epz_e, epz_s])
 
-# Sustituir mes actual en la tendencia productiva editada
+# Sustituir mes actual en la tendencia productiva editada automáticamente
 for _, r in df_p_f.iterrows():
     idx = (df_tp_f['Grupo'] == r['Grupo']) & (df_tp_f['Mes'] == m_sel)
     if any(idx): df_tp_f.loc[idx, ['Totales', 'Scrap', 'RT']] = [r['Totales'], r['Scrap'], r['Retrabajo']]
     else: df_tp_f = pd.concat([df_tp_f, pd.DataFrame([{'Grupo':r['Grupo'], 'Mes':m_sel, 'Mes_Str':MESES_MAP[m_sel], 'Totales':r['Totales'], 'Scrap':r['Scrap'], 'RT':r['Retrabajo']}])], ignore_index=True)
 
 # --- GENERACIÓN ---
-with td:
+with t_d:
     st.subheader(f"🖨️ Generar y Descargar ({planta_sel} - {m_sel}/{a_sel})")
     c1, c2, c3 = st.columns(3)
     l_rep = f"{m_sel}/{a_sel}"
