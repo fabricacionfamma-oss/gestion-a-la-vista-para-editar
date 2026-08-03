@@ -4,9 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import tempfile
 import os
-import calendar
 from fpdf import FPDF
-from datetime import timedelta
 
 # ==========================================
 # 0. CONFIGURACIÓN Y CONSTANTES
@@ -187,7 +185,7 @@ def fetch_data_from_db(planta, fecha_ini, fecha_fin, mes, anio):
         return generate_empty_schemas()
 
 # ==========================================
-# 3. CONVERSORES Y MOTORES DE PDF (Rehidratados con los datos editados)
+# 3. CONVERSORES Y MOTORES DE PDF
 # ==========================================
 def run_pdf_oee(planta, area, label_rep, df_kpi, df_trend, df_fallos, conf):
     theme_color = (15, 76, 129) if area.upper() == "ESTAMPADO" else ((211, 84, 0) if area.upper() == "SOLDADURA" else (40, 40, 40))
@@ -407,7 +405,7 @@ if not df_r.empty:
 
 # 4. Base Tendencias OEE (Mes a Mes)
 res_toee = []
-if planta == 'FUMISCOR' and not df_t.empty:
+if planta_sel == 'FUMISCOR' and not df_t.empty:
     dtm = df_t.copy(); dtm['Grupo'] = dtm['Máquina'].astype(str).str.strip().str.upper().map(mapa).fillna('OTRO')
     def cto(g_name, d):
         for m, grp in d.groupby('Month'):
@@ -419,7 +417,7 @@ if planta == 'FUMISCOR' and not df_t.empty:
             res_toee.append({'Grupo': g_name, 'Mes': int(m), 'Mes_Str': MESES_MAP[int(m)], 'OEE': vo*100 if vo<=1.5 else vo, 'Performance': vp*100 if vp<=1.5 else vp, 'Disponibilidad': vd*100 if vd<=1.5 else vd, 'Calidad': vc*100 if vc<=1.5 else vc})
     cto('GLOBAL', dtm); cto('ESTAMPADO', dtm[dtm['Grupo'].isin(conf['grupos_estampado'])]); cto('SOLDADURA', dtm[dtm['Grupo'].isin(conf['grupos_soldadura'])])
     for g in conf['grupos_estampado'] + conf['grupos_soldadura']: cto(g, dtm[dtm['Grupo'] == g])
-elif planta == 'FAMMA':
+elif planta_sel == 'FAMMA':
     for m, grp in df_t06.groupby('Month'): res_toee.append({'Grupo': 'GLOBAL', 'Mes': int(m), 'Mes_Str': MESES_MAP[int(m)], 'OEE': grp['OEE_Num'].iloc[0], 'Performance': grp['Perf_Num'].iloc[0], 'Disponibilidad': grp['Disp_Num'].iloc[0], 'Calidad': grp['Cal_Num'].iloc[0]})
     for m, grp in df_t05[df_t05['Planta'] == 'ESTAMPADO'].groupby('Month'): res_toee.append({'Grupo': 'ESTAMPADO', 'Mes': int(m), 'Mes_Str': MESES_MAP[int(m)], 'OEE': grp['OEE_Num'].iloc[0], 'Performance': grp['Perf_Num'].iloc[0], 'Disponibilidad': grp['Disp_Num'].iloc[0], 'Calidad': grp['Cal_Num'].iloc[0]})
     for m, grp in df_t05[df_t05['Planta'] == 'SOLDADURA'].groupby('Month'): res_toee.append({'Grupo': 'SOLDADURA', 'Mes': int(m), 'Mes_Str': MESES_MAP[int(m)], 'OEE': grp['OEE_Num'].iloc[0], 'Performance': grp['Perf_Num'].iloc[0], 'Disponibilidad': grp['Disp_Num'].iloc[0], 'Calidad': grp['Cal_Num'].iloc[0]})
